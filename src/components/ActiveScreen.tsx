@@ -8,9 +8,10 @@ interface ActiveScreenProps {
   voiceState: VoiceState;
   currentTranscript: string;
   lastResponse: string;
+  errorMessage?: string | null;
 }
 
-export const ActiveScreen: React.FC<ActiveScreenProps> = ({ voiceState, currentTranscript, lastResponse }) => {
+export const ActiveScreen: React.FC<ActiveScreenProps> = ({ voiceState, currentTranscript, lastResponse, errorMessage }) => {
   
   return (
     <motion.div
@@ -43,7 +44,7 @@ export const ActiveScreen: React.FC<ActiveScreenProps> = ({ voiceState, currentT
         >
           <h1 className="text-4xl md:text-5xl font-semibold tracking-tight text-white drop-shadow-lg">
            {voiceState === VoiceState.ERROR 
-             ? "Microphone Access Needed" 
+             ? (errorMessage || "Microphone Access Needed")
              : (lastResponse || "How can I help you?")}
           </h1>
         </motion.div>

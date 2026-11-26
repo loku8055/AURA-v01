@@ -58,6 +58,7 @@ const IDLE_TIMEOUT_MS = 30000; // 30 Seconds Timeout
 const AppContent: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [voiceState, setVoiceState] = useState<VoiceState>(VoiceState.LISTENING);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
   const [navigationPath, setNavigationPath] = useState<MapNode[] | null>(null);
@@ -73,6 +74,7 @@ const AppContent: React.FC = () => {
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const streamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const lastSendTimeRef = useRef<number>(0);
 
@@ -81,6 +83,8 @@ const AppContent: React.FC = () => {
 
   const currentInputTranscriptionRef = useRef('');
   const currentOutputTranscriptionRef = useRef('');
+  const inputTurnIdRef = useRef(0);
+  const translateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const nextStartTimeRef = useRef(0);
   const audioSourcesRef = useRef(new Set<AudioBufferSourceNode>());
@@ -122,12 +126,17 @@ const AppContent: React.FC = () => {
 
   // --- Live API Logic ---
 
-  const endConversation = useCallback(() => {
+  const endConversation = useCallback((preserveError = false) => {
     if (sessionPromiseRef.current) {
-      sessionPromiseRef.current.then((session: any) => session.close());
+      sessionPromiseRef.current.then((session: any) => session.close()).catch(() => {});
       sessionPromiseRef.current = null;
     }
+    sessionRef.current = null;
 
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
     if (scriptProcessorRef.current) {
       scriptProcessorRef.current.disconnect();
       scriptProcessorRef.current = null;
@@ -143,22 +152,47 @@ const AppContent: React.FC = () => {
     }
 
     if (inputAudioContextRef.current && inputAudioContextRef.current.state !== 'closed') {
-      inputAudioContextRef.current.close();
+      inputAudioContextRef.current.close().catch(() => {});
     }
     if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
-      outputAudioContextRef.current.close();
+      outputAudioContextRef.current.close().catch(() => {});
     }
 
-    audioSourcesRef.current.forEach(source => source.stop());
+    audioSourcesRef.current.forEach(source => {
+      try { source.stop(); } catch {}
+    });
     audioSourcesRef.current.clear();
     nextStartTimeRef.current = 0;
     audioBufferRef.current = [];
+    if (translateTimerRef.current) {
+      clearTimeout(translateTimerRef.current);
+      translateTimerRef.current = null;
+    }
 
-    setVoiceState(VoiceState.LISTENING);
+    if (!preserveError) {
+      setVoiceState(VoiceState.LISTENING);
+    }
   }, []);
 
   const startConversation = useCallback(async () => {
     if (sessionPromiseRef.current) return; // Already started
+
+    const apiKey = import.meta.env.VITE_API_KEY;
+    if (!apiKey) {
+      console.error('Missing VITE_API_KEY in .env / .env.local');
+      setErrorMessage('Missing VITE_API_KEY');
+      setVoiceState(VoiceState.ERROR);
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      console.error('navigator.mediaDevices.getUserMedia is unavailable (use http://localhost:8080 or HTTPS)');
+      setErrorMessage('Use localhost or HTTPS for Mic');
+      setVoiceState(VoiceState.ERROR);
+      return;
+    }
+
+    setErrorMessage(null);
 
     try {
       console.log("Requesting microphone access...");
@@ -173,10 +207,31 @@ const AppContent: React.FC = () => {
         console.log("Resuming input AudioContext...");
         await inputAudioContextRef.current.resume();
       }
+      if (outputAudioContextRef.current.state === 'suspended') {
+        await outputAudioContextRef.current.resume();
+      }
       console.log("AudioContext state:", inputAudioContextRef.current.state);
 
       // Connect to live API (store both promise and resolved session)
-      const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_API_KEY });
+      const ai = new GoogleGenAI({ apiKey });
+
+      const translateToEnglish = async (rawText: string, turnId: number) => {
+        const trimmed = rawText.trim();
+        if (!trimmed) return;
+        try {
+          const res = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `Convert the following speech transcription into clean English text. If it is English words written phonetically in Hindi/Devanagari script (e.g. "डि पार्ट में ट ऑफ ए आई एन डी एस" -> "Department of AI and DS"), restore the exact English words. If it is Hindi, translate it into natural English. Return ONLY the English text with no quotes or extra explanation.\n\nText: ${trimmed}`,
+          });
+          const english = res.text?.trim();
+          if (english && turnId === inputTurnIdRef.current) {
+            setTranscript(english);
+          }
+        } catch (err) {
+          console.warn('Transcript English conversion failed:', err);
+        }
+      };
+
       const connectPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
@@ -256,11 +311,33 @@ const AppContent: React.FC = () => {
               setResponse(currentOutputTranscriptionRef.current);
             }
             if (message.serverContent?.inputTranscription) {
+              if (!currentInputTranscriptionRef.current) {
+                inputTurnIdRef.current += 1;
+              }
               currentInputTranscriptionRef.current += message.serverContent.inputTranscription.text + ' ';
-              setTranscript(currentInputTranscriptionRef.current);
+              const raw = currentInputTranscriptionRef.current;
+              const turnId = inputTurnIdRef.current;
+
+              if (/[\u0900-\u097F]/.test(raw)) {
+                if (translateTimerRef.current) clearTimeout(translateTimerRef.current);
+                translateTimerRef.current = setTimeout(() => {
+                  translateToEnglish(raw, turnId);
+                }, 250);
+              } else {
+                setTranscript(raw);
+              }
             }
 
             if (message.serverContent?.turnComplete) {
+              const finalInput = currentInputTranscriptionRef.current;
+              const turnId = inputTurnIdRef.current;
+              if (translateTimerRef.current) {
+                clearTimeout(translateTimerRef.current);
+                translateTimerRef.current = null;
+              }
+              if (finalInput && /[\u0900-\u097F]/.test(finalInput)) {
+                translateToEnglish(finalInput, turnId);
+              }
               currentInputTranscriptionRef.current = '';
               currentOutputTranscriptionRef.current = '';
               setVoiceState(VoiceState.LISTENING);
@@ -290,12 +367,19 @@ const AppContent: React.FC = () => {
           },
           onerror: (e: ErrorEvent) => {
             console.error('API Error:', e);
+            setErrorMessage('Voice Connection Error');
             setVoiceState(VoiceState.ERROR);
-            endConversation();
+            endConversation(true);
           },
-          onclose: () => {
-            console.log("Live API Connection Closed");
-            endConversation();
+          onclose: (e: any) => {
+            console.log("Live API Connection Closed", e);
+            if (e?.reason) {
+              setErrorMessage(e.reason);
+              setVoiceState(VoiceState.ERROR);
+              endConversation(true);
+            } else {
+              endConversation();
+            }
           },
         },
       });
@@ -359,9 +443,10 @@ const AppContent: React.FC = () => {
           await inputAudioContextRef.current!.audioWorklet.addModule('/recorder-processor.js');
           const worklet = new (window as any).AudioWorkletNode(inputAudioContextRef.current!, 'recorder-processor');
           worklet.port.onmessage = (ev: any) => {
-            const f32 = new Float32Array(ev.data.buffer);
+            const f32 = ev.data instanceof Float32Array ? ev.data : new Float32Array(ev.data.buffer);
             sendFrame(f32);
           };
+          workletNodeRef.current = worklet;
           scriptProcessorRef.current = null;
           source.connect(worklet);
         } catch (e) {
@@ -387,12 +472,13 @@ const AppContent: React.FC = () => {
         scriptProcessor.connect(inputAudioContextRef.current!.destination);
       }
 
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to start conversation:', err);
+      setErrorMessage(err?.name === 'NotAllowedError' ? 'Microphone Access Needed' : (err?.message || 'Microphone Error'));
       setVoiceState(VoiceState.ERROR);
-      endConversation();
+      endConversation(true);
     }
-  }, []);
+  }, [endConversation]);
 
   // --- Presence Logic (Face Detection + Timeout) ---
 
@@ -505,11 +591,24 @@ const AppContent: React.FC = () => {
             <motion.div
               key="active"
               className="w-full h-full relative"
+              onClick={async () => {
+                lastPresenceTimeRef.current = Date.now();
+                if (inputAudioContextRef.current?.state === 'suspended') {
+                  await inputAudioContextRef.current.resume().catch(() => {});
+                }
+                if (outputAudioContextRef.current?.state === 'suspended') {
+                  await outputAudioContextRef.current.resume().catch(() => {});
+                }
+                if (voiceState === VoiceState.ERROR || !sessionPromiseRef.current) {
+                  startConversation();
+                }
+              }}
             >
               <ActiveScreen
                 voiceState={voiceState}
                 currentTranscript={transcript}
                 lastResponse={response}
+                errorMessage={errorMessage}
               />
 
               {/* Map View Overlay */}
